@@ -376,3 +376,140 @@ class TestMemoryStats:
         assert response.status_code == 200
         data = response.json()
         assert "requests" in data
+
+
+@pytest.fixture
+def memory_client_global(temp_memory_db):
+    """Memory-enabled client with GLOBAL storage mode.
+
+    GLOBAL keeps every memory in a single SQLite file regardless of
+    project routing, so tests that pre-seed via direct backend access
+    are guaranteed to share the same DB as the proxy's runtime backend.
+    """
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        memory_enabled=True,
+        memory_backend="local",
+        memory_db_path=temp_memory_db,
+        memory_inject_tools=True,
+        memory_inject_context=True,
+        memory_top_k=5,
+        memory_storage_mode="global",
+    )
+    app = create_app(config)
+    with TestClient(app) as client:
+        yield client
+
+
+@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
+class TestMemoryIdAutoTailAndUpdate:
+    """End-to-end live: model uses [memory_id] from auto-tail to call memory_update.
+
+    Validates that the IDs we added to the auto-injected memory block
+    (see ``MemoryHandler.search_and_format_context``) are extractable by
+    a real Claude model and can be passed directly to ``memory_update``
+    without an intervening ``memory_search`` round-trip.
+    """
+
+    def test_model_uses_memory_id_to_call_memory_update(
+        self,
+        memory_client_global,
+        anthropic_api_key,
+        temp_memory_db,
+    ):
+        import asyncio
+
+        from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+
+        user_id = f"test-id-update-{int(time.time())}"
+
+        # Pre-seed a known memory directly via a fresh backend so we
+        # control its content and learn its ID up front. Same db_path
+        # AND same embedder (ONNX) as the proxy backend → both read
+        # the same SQLite file and produce comparable vectors.
+        async def _seed() -> str:
+            backend = LocalBackend(
+                LocalBackendConfig(
+                    db_path=temp_memory_db,
+                    embedder_backend="onnx",
+                    embedder_model="all-MiniLM-L6-v2",
+                    vector_dimension=384,
+                )
+            )
+            mem = await backend.save_memory(
+                content="The user's favorite color is blue.",
+                user_id=user_id,
+            )
+            return mem.id
+
+        memory_id = asyncio.run(_seed())
+        assert memory_id, "save_memory should return a usable id"
+
+        # Let the SQLite write + index settle before the proxy reads.
+        time.sleep(0.5)
+
+        # Capture tool calls the proxy executes, so we can assert the
+        # model picked the right tool with the right memory_id.
+        proxy = memory_client_global.app.state.proxy
+        assert proxy.memory_handler is not None
+        recorded: list[dict] = []
+        original_execute = proxy.memory_handler._execute_memory_tool
+
+        async def _capturing_execute(
+            tool_name, input_data, user_id_arg, provider, request_context=None
+        ):
+            recorded.append({"tool_name": tool_name, "input": dict(input_data)})
+            return await original_execute(
+                tool_name,
+                input_data,
+                user_id_arg,
+                provider,
+                request_context=request_context,
+            )
+
+        proxy.memory_handler._execute_memory_tool = _capturing_execute  # type: ignore[assignment]
+
+        try:
+            response = memory_client_global.post(
+                "/v1/messages",
+                headers={
+                    "x-api-key": anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                    "x-headroom-user-id": user_id,
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 800,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Quick correction: my favorite color is actually "
+                                "green, not blue. Please call the memory_update "
+                                "tool to fix the relevant memory in your context. "
+                                "The relevant memories block lists each memory's "
+                                "ID in square brackets — use that ID for "
+                                "memory_id."
+                            ),
+                        }
+                    ],
+                },
+            )
+        finally:
+            proxy.memory_handler._execute_memory_tool = original_execute  # type: ignore[assignment]
+
+        assert response.status_code == 200, response.text
+
+        # The model should have called memory_update at least once.
+        update_calls = [c for c in recorded if c["tool_name"] == "memory_update"]
+        assert update_calls, f"Expected at least one memory_update call. Recorded: {recorded}"
+
+        # And it should reference the exact ID we seeded — i.e. the
+        # model used the [id] from the auto-tail block, not a guess.
+        assert any(c["input"].get("memory_id") == memory_id for c in update_calls), (
+            f"Expected memory_update(memory_id={memory_id!r}); got inputs: "
+            f"{[c['input'] for c in update_calls]}"
+        )

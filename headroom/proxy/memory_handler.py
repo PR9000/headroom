@@ -70,7 +70,13 @@ class MemoryMode(str, enum.Enum):
 
 
 # Memory tool names for detection (Headroom's custom tools)
-MEMORY_TOOL_NAMES = {"memory_save", "memory_search", "memory_update", "memory_delete"}
+MEMORY_TOOL_NAMES = {
+    "memory_save",
+    "memory_search",
+    "memory_update",
+    "memory_delete",
+    "memory_list",
+}
 
 # Anthropic's native memory tool name
 NATIVE_MEMORY_TOOL_NAME = "memory"
@@ -86,6 +92,26 @@ NATIVE_MEMORY_TOOL_TYPE = "memory_20250818"
 # stays False so that subsequent requests retry instead of deadlocking.
 # See wiki/plans/2026-04-17-fix-codex-proxy-resilience-plan.md "Risks" row 7.
 STARTUP_INIT_TIMEOUT_SECONDS = 30.0
+
+
+def _serialize_created_at(value: Any) -> str | None:
+    """Best-effort timestamp serialization for tool-result payloads.
+
+    The backend may return ``datetime`` (from a freshly-saved row) or
+    string (from a hydrated SQLite row). Either way the model needs
+    a string to render in chat. Unparseable values → None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "isoformat"):
+        try:
+            iso = value.isoformat()
+            return iso if isinstance(iso, str) else str(iso)
+        except Exception:
+            return str(value)
+    return str(value)
 
 
 @dataclass
@@ -732,10 +758,17 @@ class MemoryHandler:
             # post-filter results too).
             filtered_results = filtered_results[: effective_budget.max_entries]
 
-            # Format as context.
+            # Format as context. Each row prefixes the memory ID so the
+            # model can address it directly (e.g.,
+            # ``memory_update(id, ...)``) without first calling
+            # ``memory_search`` to discover IDs. Pre-this-PR the block
+            # only carried content; the model had to round-trip through
+            # search to do any UPDATE / DELETE on a row visible in the
+            # auto-injected tail.
             memory_lines = []
             for i, result in enumerate(filtered_results, 1):
-                memory_lines.append(f"{i}. {result.memory.content}")
+                memory_id = getattr(result.memory, "id", None) or "?"
+                memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
                 if hasattr(result, "related_entities") and result.related_entities:
                     entities_str = ", ".join(result.related_entities[:3])
                     memory_lines.append(f"   (Related: {entities_str})")
@@ -754,7 +787,10 @@ The following information was previously saved in this scope:
 
 {chr(10).join(memory_lines)}
 
-Use this context to provide personalized and contextually relevant responses."""
+Each row begins with an ID in square brackets. To update or delete a row, \
+pass that ID directly to memory_update or memory_delete — you do not need \
+to call memory_search first to discover IDs. Use this context to provide \
+personalized, contextually relevant responses."""
 
         # Apply the token-budget cap on the formatted block. Pre-this-
         # PR there was no cap — up to ~4000 tokens could be injected
@@ -1010,6 +1046,8 @@ Use this context to provide personalized and contextually relevant responses."""
                 return await self._execute_update(input_data, user_id, provider, request_context)
             elif tool_name == "memory_delete":
                 return await self._execute_delete(input_data, user_id, request_context)
+            elif tool_name == "memory_list":
+                return await self._execute_list(input_data, user_id, request_context)
             else:
                 return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
@@ -1303,6 +1341,75 @@ Use this context to provide personalized and contextually relevant responses."""
             {
                 "status": "deleted" if deleted else "not_found",
                 "memory_id": memory_id,
+            }
+        )
+
+    async def _execute_list(
+        self,
+        input_data: dict[str, Any],
+        user_id: str,
+        request_context: RequestContext | None = None,
+    ) -> str:
+        """Execute memory_list tool — chronological browse without semantic query.
+
+        Returns memories in reverse-chronological order (newest first).
+        Different from ``memory_search`` (which needs a semantic query).
+        Use case: the model needs a memory ID for update/delete but
+        doesn't have a good query string to find it.
+
+        Backend dispatch: prefer ``list_memories`` if the backend
+        exposes it; otherwise fall back to an empty-query
+        ``search_memories(query="", top_k=limit)`` which most backends
+        treat as "return everything ordered by recency."
+        """
+        limit = input_data.get("limit", 10)
+        try:
+            limit = max(1, min(100, int(limit)))
+        except (TypeError, ValueError):
+            limit = 10
+
+        await self._ensure_initialized()
+        if not self._backend:
+            return json.dumps({"status": "error", "error": "Memory backend not initialized"})
+
+        backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+
+        # Prefer a native list_memories if the backend has one (LocalBackend
+        # does); fall back to a recency-keyed search when not available.
+        list_fn = getattr(backend, "list_memories", None)
+        if callable(list_fn):
+            try:
+                results = await list_fn(user_id=effective_user_id, limit=limit)
+            except Exception as e:
+                logger.warning(f"Memory: list_memories failed for user {effective_user_id}: {e}")
+                return json.dumps({"status": "error", "error": str(e)})
+        else:
+            try:
+                results = await backend.search_memories(
+                    query="",
+                    user_id=effective_user_id,
+                    top_k=limit,
+                )
+            except Exception as e:
+                logger.warning(f"Memory: list fallback search failed: {e}")
+                return json.dumps({"status": "error", "error": str(e)})
+
+        entries: list[dict[str, Any]] = []
+        for r in results:
+            mem = getattr(r, "memory", r)
+            entries.append(
+                {
+                    "id": getattr(mem, "id", None),
+                    "content": getattr(mem, "content", ""),
+                    "created_at": _serialize_created_at(getattr(mem, "created_at", None)),
+                }
+            )
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "count": len(entries),
+                "memories": entries,
             }
         )
 
