@@ -71,6 +71,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`/debug/memory` loopback guard.** The endpoint was missing the
+  `Depends(_require_loopback)` guard that all other `/debug/*` endpoints carry.
+  External callers can no longer reach it.
+- **`retry_max_attempts` zero guard.** When `retry_enabled=True` and
+  `retry_max_attempts=0` the retry loop exited without setting `last_error`,
+  causing `raise last_error` to raise `TypeError: exceptions must derive from
+  BaseException`. A `RuntimeError` with an actionable message is now raised
+  instead, and `ProxyConfig.__post_init__` rejects `retry_max_attempts < 1`
+  at construction time.
+- **Blocking subprocess on async event loop.** `_read_rtk_lifetime_stats` and
+  `_read_lean_ctx_lifetime_stats` called `subprocess.run` directly on the
+  asyncio thread. The `initialize_context_tool_session_baseline` function is
+  now `async` and offloads the subprocess via `asyncio.to_thread`; the stats
+  endpoint uses `await asyncio.to_thread(_get_context_tool_stats)`.
+- **Hardcoded Neo4j credential in `docker-compose.yml`.** `NEO4J_AUTH` now
+  defaults to `${NEO4J_AUTH:-neo4j/devpassword}` and is documented in
+  `.env.example` (excluded from `.gitignore` via `!.env.example`).
+- **`SemanticCache.get_memory_stats()` concurrent iteration.** The method
+  iterates `self._cache.values()` without holding the async lock. A snapshot
+  is now taken via `list(self._cache.values())` before iterating to avoid
+  `RuntimeError: dictionary changed size during iteration` under async load.
+- **Default Neo4j password in `ProxyConfig`.** `memory_neo4j_password` default
+  changed from `"password"` to `""`. The proxy startup path now emits a
+  `logger.warning` when `memory_backend == "qdrant-neo4j"` and the password
+  is empty, prompting operators to set a real credential.
+
 ### Fixed
 - **PyPI install clarity and release gating.** Documented `pipx --python python3.13`
   for environments where unsupported Python wheel tags cause older-version

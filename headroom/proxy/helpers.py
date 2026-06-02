@@ -1233,11 +1233,11 @@ def _read_context_tool_lifetime_stats(tool: str) -> dict[str, Any] | None:
     return _read_rtk_lifetime_stats()
 
 
-def initialize_context_tool_session_baseline() -> None:
+async def initialize_context_tool_session_baseline() -> None:
     """Pin the current context-tool counters as the proxy-session baseline."""
 
     tool = _selected_context_tool()
-    payload = _read_context_tool_lifetime_stats(tool)
+    payload = await asyncio.to_thread(_read_context_tool_lifetime_stats, tool)
     with _context_tool_stats_cache_lock:
         _context_tool_session_baseline.update(
             {
@@ -1261,10 +1261,10 @@ def initialize_context_tool_session_baseline() -> None:
         )
 
 
-def initialize_rtk_session_baseline() -> None:
-    """Pin the current context-tool counters as the proxy-session baseline."""
+async def initialize_rtk_session_baseline() -> None:
+    """Backward-compatible alias for initialize_context_tool_session_baseline."""
 
-    initialize_context_tool_session_baseline()
+    await initialize_context_tool_session_baseline()
 
 
 def _get_context_tool_stats() -> dict[str, Any] | None:
