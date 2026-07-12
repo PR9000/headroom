@@ -33,6 +33,15 @@ from headroom.proxy import (
     wire_debug_format_policy,
     wire_debug_redaction_policy,
 )
+from headroom.proxy.beta_header_policy import (
+    BETA_HEADER_STICKY_DEFAULT,
+    BETA_HEADER_STICKY_ENV,
+    BETA_TRACKER_MAX_SESSIONS_DEFAULT,
+    BETA_TRACKER_MAX_SESSIONS_ENV,
+    BetaHeaderStickyMode,
+    resolve_beta_header_sticky_mode,
+    resolve_beta_tracker_max_sessions,
+)
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -1530,12 +1539,11 @@ def log_outbound_headers(
 # the tracker (returns the client value verbatim). That mode is loud and
 # explicit per realignment build constraint #4 — NOT a silent fallback.
 
-_BETA_HEADER_STICKY_ENV = "HEADROOM_BETA_HEADER_STICKY"
-BetaHeaderStickyMode = Literal["enabled", "disabled"]
-_BETA_HEADER_STICKY_DEFAULT: BetaHeaderStickyMode = "enabled"
+_BETA_HEADER_STICKY_ENV = BETA_HEADER_STICKY_ENV
+_BETA_HEADER_STICKY_DEFAULT = BETA_HEADER_STICKY_DEFAULT
 
-_BETA_TRACKER_MAX_SESSIONS_ENV = "HEADROOM_BETA_TRACKER_MAX_SESSIONS"
-_BETA_TRACKER_MAX_SESSIONS_DEFAULT = 1000
+_BETA_TRACKER_MAX_SESSIONS_ENV = BETA_TRACKER_MAX_SESSIONS_ENV
+_BETA_TRACKER_MAX_SESSIONS_DEFAULT = BETA_TRACKER_MAX_SESSIONS_DEFAULT
 
 
 def get_beta_header_sticky_mode() -> BetaHeaderStickyMode:
@@ -1545,28 +1553,12 @@ def get_beta_header_sticky_mode() -> BetaHeaderStickyMode:
     restart. Unknown values raise loudly per the no-silent-fallback
     build constraint.
     """
-    raw = os.environ.get(_BETA_HEADER_STICKY_ENV, "").strip().lower()
-    if not raw:
-        return _BETA_HEADER_STICKY_DEFAULT
-    if raw in ("enabled", "disabled"):
-        return cast(BetaHeaderStickyMode, raw)
-    raise ValueError(f"Invalid {_BETA_HEADER_STICKY_ENV}={raw!r}; expected 'enabled' or 'disabled'")
+    return resolve_beta_header_sticky_mode(os.environ.get(_BETA_HEADER_STICKY_ENV))
 
 
 def get_beta_tracker_max_sessions() -> int:
     """Return the LRU bound for `SessionBetaTracker` (sessions cap)."""
-    raw = os.environ.get(_BETA_TRACKER_MAX_SESSIONS_ENV, "").strip()
-    if not raw:
-        return _BETA_TRACKER_MAX_SESSIONS_DEFAULT
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid {_BETA_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int"
-        ) from exc
-    if value <= 0:
-        raise ValueError(f"Invalid {_BETA_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int")
-    return value
+    return resolve_beta_tracker_max_sessions(os.environ.get(_BETA_TRACKER_MAX_SESSIONS_ENV))
 
 
 def _split_beta_tokens(value: str | None) -> list[str]:
