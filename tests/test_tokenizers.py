@@ -51,6 +51,22 @@ class TestTiktokenCounter:
         # gpt-4-turbo snapshots use cl100k_base.
         assert get_encoding_for_model("gpt-4-turbo-2099") == "cl100k_base"
 
+    def test_gpt41_and_o4_families_use_o200k(self):
+        """gpt-4.1 / gpt-4.5 / o4 use o200k_base, not cl100k_base.
+
+        Regression: gpt-4.1* and gpt-4.5* matched the broad "gpt-4" prefix and
+        resolved to cl100k_base, and o4* matched no prefix and fell to the
+        cl100k_base default — both wrong encodings for those models.
+        """
+        from headroom.tokenizers.tiktoken_counter import get_encoding_for_model
+
+        assert get_encoding_for_model("gpt-4.1") == "o200k_base"
+        assert get_encoding_for_model("gpt-4.1-mini") == "o200k_base"
+        assert get_encoding_for_model("gpt-4.5-preview") == "o200k_base"
+        assert get_encoding_for_model("o4-mini") == "o200k_base"
+        # A plain gpt-4 snapshot must still use cl100k_base (not shadowed).
+        assert get_encoding_for_model("gpt-4-0613") == "cl100k_base"
+
     def test_count_text_empty(self):
         """Test counting empty text."""
         counter = TiktokenCounter()
