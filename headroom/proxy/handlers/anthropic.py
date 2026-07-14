@@ -1314,16 +1314,79 @@ class AnthropicHandlerMixin:
                                     ),
                                 )
 
-                                class _DeferredCompressionResult:
-                                    messages = working_messages
-                                    transforms_applied = [
-                                        "deferred:background_compression"
+                                # Cold-start fast pass: run everything EXCEPT the
+                                # Kompress ML stage synchronously before forwarding.
+                                # The byte-identical freeze (#1850) locks a session
+                                # to whatever form its cold start put in the provider
+                                # cache; deferring the WHOLE pipeline locks in the raw
+                                # transcript and forfeits the session's savings for
+                                # its lifetime — including sub-second wins like
+                                # read_lifecycle stale-read drops. Only Kompress can
+                                # blow the request budget (#1171), so only Kompress
+                                # stays deferred. Fail-open: on timeout/error the
+                                # request forwards exactly as before this pass
+                                # existed. On timeout the worker can't be cancelled
+                                # (Python can't preempt a running thread), but
+                                # _run_compression_in_executor runs it on the bounded
+                                # compression pool and tracks it via the leaked-thread
+                                # metric, so stragglers are capped and observable
+                                # rather than unbounded. The pass is also bounded by
+                                # routing + statistical crushers (observed seconds even
+                                # on multi-M-token counts).
+                                from headroom.proxy.helpers import (
+                                    COLD_START_FAST_PASS_TIMEOUT_SECONDS,
+                                )
+
+                                _fast_pass = None
+                                try:
+                                    async with stage_timer.measure("compression_first_stage"):
+                                        _fast_pass = await self._run_compression_in_executor(
+                                            lambda: self.anthropic_pipeline.apply(
+                                                messages=working_messages,
+                                                model=model,
+                                                model_limit=context_limit,
+                                                context=extract_user_query(working_messages),
+                                                frozen_message_count=frozen_message_count,
+                                                idle_seconds=idle_seconds,
+                                                biases=biases,
+                                                request_id=request_id,
+                                                compression_policy=compression_policy,
+                                                skip_kompress=True,
+                                                **proxy_pipeline_kwargs(self.config),
+                                            ),
+                                            timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
+                                        )
+                                except Exception as e:
+                                    logger.info(
+                                        "[%s] Cold-start fast pass skipped (%s: %s); "
+                                        "deferring full pipeline to background",
+                                        request_id,
+                                        type(e).__name__,
+                                        e,
+                                    )
+
+                                if _fast_pass is not None:
+                                    comp_cache.update_from_result(messages, _fast_pass.messages)
+                                    _fast_pass.transforms_applied = list(
+                                        _fast_pass.transforms_applied
+                                    ) + [
+                                        "deferred:kompress_background"
                                         if accepted
                                         else "deferred:dropped"
                                     ]
-                                    timing = {}
+                                    result = _fast_pass
+                                else:
 
-                                result = _DeferredCompressionResult()
+                                    class _DeferredCompressionResult:
+                                        messages = working_messages
+                                        transforms_applied = [
+                                            "deferred:background_compression"
+                                            if accepted
+                                            else "deferred:dropped"
+                                        ]
+                                        timing = {}
+
+                                    result = _DeferredCompressionResult()
                             else:
                                 async with stage_timer.measure("compression_first_stage"):
                                     result = await self._run_compression_in_executor(
