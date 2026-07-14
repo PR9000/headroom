@@ -930,6 +930,14 @@ class AnthropicHandlerMixin:
                 "thinking": body.get("thinking"),
                 "output_config": body.get("output_config"),
             }
+            # Snapshot the lookup messages too. `messages` is the primary cache
+            # key component, but it is reassigned below by the security scan, the
+            # pre_compress hook, and image compression, so caching the response
+            # under the live `messages` would store it under a different key than
+            # it was looked up by — the cache would never hit and would fill with
+            # unreachable entries. Reuse this raw snapshot verbatim at cache.set
+            # (the same reason cache_key_fields is snapshotted here, #327).
+            cache_lookup_messages = messages
             # Check cache (non-streaming only)
             cache_hit = False
             if self.cache and not stream:
@@ -2910,7 +2918,27 @@ class AnthropicHandlerMixin:
                                 content=ccr_content,
                                 headers=ccr_response_headers,
                             )
-                            logger.info(f"[{request_id}] CCR: Retrieval handled successfully")
+                            # Only claim success when no headroom_retrieve remains.
+                            # On an intentional mixed-tool skip (#839) the response
+                            # still carries headroom_retrieve for the client to
+                            # resolve — logging "handled successfully" there is
+                            # misleading. Classify via the shared, provider-generic
+                            # residual-CCR signal.
+                            from headroom.ccr.response_handler import (
+                                RESIDUAL_CCR_SKIPPED_MIXED,
+                            )
+
+                            residual_status = self.ccr_response_handler.residual_ccr_status(
+                                final_resp_json, "anthropic"
+                            )
+                            if residual_status == RESIDUAL_CCR_SKIPPED_MIXED:
+                                logger.info(
+                                    f"[{request_id}] CCR: Skipped retrieval — "
+                                    "headroom_retrieve returned alongside a client "
+                                    "tool for the client to resolve"
+                                )
+                            else:
+                                logger.info(f"[{request_id}] CCR: Retrieval handled successfully")
                         except Exception as e:
                             import traceback
 
@@ -3057,10 +3085,12 @@ class AnthropicHandlerMixin:
                         original_messages=next_original_messages,
                     )
 
-                    # Cache response
+                    # Cache response under the SAME key it was looked up by:
+                    # cache_lookup_messages is the raw pre-mutation snapshot, not
+                    # the live (compressed/hooked) `messages` (#327).
                     if self.cache and response.status_code == 200:
                         await self.cache.set(
-                            messages,
+                            cache_lookup_messages,
                             model,
                             response.content,
                             dict(response.headers),
@@ -3221,13 +3251,28 @@ class AnthropicHandlerMixin:
                             }
                             return f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
+                        # Residual headroom_retrieve is only a hard failure when it
+                        # is NOT an intentional mixed-tool skip. When the model
+                        # emitted headroom_retrieve alongside a client tool (#839),
+                        # the handler deliberately leaves both tool_use blocks in
+                        # place for the client to resolve — a legal turn that the
+                        # non-streaming path returns as 200. Fall through to the
+                        # SSE resynthesis below so the stream:true path matches it
+                        # and preserves both blocks. Use the shared, provider-generic
+                        # residual-CCR signal (not an Anthropic-only branch).
+                        from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
+
                         if (
                             self.ccr_response_handler
-                            and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "anthropic")
+                            and self.ccr_response_handler.residual_ccr_status(
+                                resp_json, "anthropic"
+                            )
+                            == RESIDUAL_CCR_ERROR
                         ):
                             logger.warning(
                                 f"[{request_id}] CCR: Buffered streaming response still "
-                                "contains headroom_retrieve after handling; failing closed"
+                                "contains an unresolved headroom_retrieve after handling; "
+                                "failing closed"
                             )
 
                             async def _residual_ccr_error_sse():
