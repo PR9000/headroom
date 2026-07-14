@@ -706,6 +706,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+* **wrap:** add `headroom wrap zcode` / `headroom unwrap zcode` for the ZCode
+  desktop app (zcode.z.ai). Follows the Pattern-B (proxy-only watcher)
+  approach: starts the proxy, injects RTK guidance into `AGENTS.md` at the
+  project root, and prints the ZCode settings the user should configure
+  (OpenAI and Anthropic base URLs). Auto-detects the enabled provider from
+  `~/.zcode/v2/config.json` and configures the proxy upstream accordingly.
+  Unwrap removes the injected RTK instructions and stops the proxy.
 * **kompress:** warn when `HEADROOM_KOMPRESS_BACKEND` is set to an unrecognized
   value instead of silently falling back to `auto`, and document the backend
   selection env var (`auto` / `onnx` / `onnx_cpu` / `onnx_coreml` / `pytorch` /
