@@ -374,21 +374,28 @@ class _BuiltinCompressorEntry:
 
     def compress(self, inp: CompressInput) -> CompressOutput:
         tokens_before = _estimate_tokens(inp.content)
-        compressed: str | None = None
+        raw: str | None = None
         if self._router is not None:
-            compressed = self._invoke(self._router, inp)
-        if compressed is None:
-            # Built-in unavailable, no bound router, or not applicable to this
-            # str input → passthrough (never blank out or expand a block).
-            compressed = inp.content
+            raw = self._invoke(self._router, inp)
+        # A ``None`` from the invoker means the built-in did not compress — it
+        # was unavailable, had no bound router, or was not applicable to this str
+        # input (e.g. HTML extraction found nothing). Report that with
+        # ``compressed=False`` and pass the ORIGINAL content through unchanged
+        # (never blank out or expand a block) so a caller can run its own
+        # fallback exactly as the historical direct call did on a ``None``
+        # result. A non-``None`` result is a real compression → ``compressed``
+        # stays True and byte-identical to before.
+        did_compress = raw is not None
+        content = raw if raw is not None else inp.content
         return CompressOutput(
-            content=compressed,
+            content=content,
             tokens_before=tokens_before,
-            tokens_after=_estimate_tokens(compressed),
+            tokens_after=_estimate_tokens(content),
             lossless=self._descriptor.lossless,
             markers=[],
             recoverable={},
             warnings=[],
+            compressed=did_compress,
         )
 
 
@@ -2671,6 +2678,50 @@ class ContentRouter(Transform):
             except Exception as exc:  # noqa: BLE001 - defensive; never break the request
                 logger.debug("external compressor %r: store.store raised (%s)", name, exc)
 
+    def _registry_compress(
+        self,
+        name: str,
+        strategy: CompressionStrategy,
+        content: str,
+        context: str,
+        bias: float,
+        config: dict[str, Any] | None = None,
+    ) -> CompressOutput | None:
+        """Compress ``content`` with a built-in via the registry, full output.
+
+        Resolves the built-in named ``name`` from :attr:`compressor_registry` and
+        runs it over the pure-data :class:`CompressInput` contract, returning the
+        adapter's :class:`CompressOutput` — including its ``compressed`` flag,
+        which reports whether the built-in actually compressed (``True``) or
+        passed the content through unchanged (``False``, e.g. the built-in
+        returned ``None`` / HTML extraction found nothing). Returns ``None`` only
+        when the built-in is not registered (defensive; the inventory is always
+        registered by ``_build_compressor_registry``).
+
+        This is the registry-resolved equivalent of the router's historical
+        ``self._get_<name>().compress(...)`` dispatch: the built-in adapter
+        delegates to the SAME ``_get_*`` getter and method with the SAME
+        arguments (``context`` as the query, ``bias`` via the budget, and any
+        per-strategy ``config`` such as ``language`` for code_aware), so on a
+        real compression the returned content is byte-identical to the direct
+        call. Callers read ``.compressed`` to reproduce the historical
+        ``compressed is None`` fallback/passthrough branches exactly.
+        """
+        entry = self.compressor_registry.get(name)
+        if entry is None:
+            return None
+        return entry.compress(
+            CompressInput(
+                content=content,
+                content_type=_CONTENT_TYPE_TO_MIME.get(
+                    self._content_type_from_strategy(strategy), "text/plain"
+                ),
+                query=context,
+                config=config or {},
+                budget={"bias": bias},
+            )
+        )
+
     def _registry_compress_content(
         self,
         name: str,
@@ -2681,8 +2732,7 @@ class ContentRouter(Transform):
     ) -> str:
         """Compress ``content`` with a built-in via the compressor registry.
 
-        Resolves the built-in named ``name`` from :attr:`compressor_registry` and
-        runs it over the pure-data :class:`CompressInput` contract, returning the
+        Thin wrapper over :meth:`_registry_compress` returning just the
         compressed string. This is the registry-resolved equivalent of the
         router's historical ``self._get_<name>().compress(...)`` dispatch: the
         built-in adapter delegates to the SAME ``_get_*`` getter and method with
@@ -2693,24 +2743,14 @@ class ContentRouter(Transform):
         availability guard (which preserves the built-in-unavailable → passthrough
         behavior the adapter's None→content collapse would otherwise hide) and
         recompute the token count with the branch's own metric, so the branch's
-        return shape is unchanged.
+        return shape is unchanged. When the built-in is not registered
+        (defensive), falls back to the unchanged content.
         """
-        entry = self.compressor_registry.get(name)
-        if entry is None:
+        output = self._registry_compress(name, strategy, content, context, bias)
+        if output is None:
             # Built-in inventory is always registered by _build_compressor_registry;
             # defensive only — fall back to the unchanged content.
             return content
-        output = entry.compress(
-            CompressInput(
-                content=content,
-                content_type=_CONTENT_TYPE_TO_MIME.get(
-                    self._content_type_from_strategy(strategy), "text/plain"
-                ),
-                query=context,
-                config={},
-                budget={"bias": bias},
-            )
-        )
         return output.content
 
     def _apply_strategy_to_content(
@@ -2854,12 +2894,26 @@ class ContentRouter(Transform):
                     compressor = self._get_code_compressor()
                     if compressor:
                         compressor_name = type(compressor).__name__
-                        result = compressor.compress(content, language=language, context=context)
-                        compressed, compressed_tokens = (
-                            result.compressed,
-                            len(result.compressed.split()),
+                        # Registry-resolved dispatch: the built-in "code_aware"
+                        # adapter delegates to this same getter+method with the
+                        # language passed through ``config``, so on a real
+                        # compression the content is byte-identical to the
+                        # historical direct call. If the adapter did NOT compress
+                        # (``compressed=False``), leave the local ``compressed``
+                        # None so the EXISTING Kompress fallback below runs
+                        # exactly as today.
+                        output = self._registry_compress(
+                            "code_aware",
+                            strategy,
+                            content,
+                            context,
+                            bias,
+                            config={"language": language},
                         )
-                        decision_reason = "code_aware"
+                        if output is not None and output.compressed:
+                            compressed = output.content
+                            compressed_tokens = len(output.content.split())
+                            decision_reason = "code_aware"
                 if compressed is None:
                     # Fallback to Kompress
                     compressed, compressed_tokens = self._try_ml_compressor(
@@ -2990,8 +3044,19 @@ class ContentRouter(Transform):
                     extractor = self._get_html_extractor()
                     if extractor:
                         compressor_name = type(extractor).__name__
-                        result = extractor.extract(content)
-                        compressed = result.extracted
+                        # Registry-resolved dispatch: the built-in "html" adapter
+                        # delegates to this same getter + extract(). It reports
+                        # ``compressed=False`` (and returns the original content)
+                        # when nothing extracts, so we collapse that to
+                        # ``compressed = None`` and the branch falls through to
+                        # the bottom passthrough exactly as the historical
+                        # ``result.extracted is None`` path (chain
+                        # ``[html, passthrough]``). A real extraction is
+                        # byte-identical to the historical ``result.extracted``.
+                        output = self._registry_compress("html", strategy, content, context, bias)
+                        compressed = (
+                            output.content if output is not None and output.compressed else None
+                        )
                         # Estimate tokens from extracted text (simple word count)
                         compressed_tokens = _estimate_tokens(compressed) if compressed else 0
                         decision_reason = "html_extractor"

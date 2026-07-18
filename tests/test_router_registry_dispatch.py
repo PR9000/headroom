@@ -34,6 +34,7 @@ from types import SimpleNamespace
 import pytest
 
 from headroom.transforms.content_router import (
+    _BUILTIN_COMPRESSOR_DESCRIPTORS,
     CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
@@ -181,6 +182,143 @@ def test_smart_crusher_deferred_unchanged(monkeypatch: pytest.MonkeyPatch) -> No
     )
     assert out == direct
     assert chain == [CompressionStrategy.SMART_CRUSHER.value]
+
+
+def _fallback_router() -> ContentRouter:
+    """Router with CODE_AWARE routing enabled and the if/elif branch terminal.
+
+    Same isolation as :func:`_router` (no relevance split, no lossy layer, markers
+    off) but with ``enable_code_aware=True`` since that flag gates CODE_AWARE
+    ROUTING (default off) rather than the getter. HTML routing is on by default.
+    """
+    return ContentRouter(
+        ContentRouterConfig(
+            relevance_split=False,
+            lossless_then_lossy=False,
+            ccr_inject_marker=False,
+            enable_code_aware=True,
+        )
+    )
+
+
+# ─────────────── flipped fallback strategies: CODE_AWARE / HTML ───────────────
+
+
+def test_code_aware_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CODE_AWARE-SUCCEEDS: the flip routes through the registry "code_aware"
+    # adapter, which delegates to the SAME getter+method with language via config.
+    # A deterministic fake getter keeps this offline (no tree-sitter) and records
+    # the exact call args, proving content/language/context flow through unchanged.
+    router = _fallback_router()
+    _isolate_branch(monkeypatch, router)
+    seen: dict[str, object] = {}
+    shrunk = "def foo(): ...  # compressed body"
+
+    def _fake_compress(content: str, language: object = None, context: str = "") -> SimpleNamespace:
+        seen.update(content=content, language=language, context=context)
+        return SimpleNamespace(compressed=shrunk)
+
+    monkeypatch.setattr(
+        router, "_get_code_compressor", lambda: SimpleNamespace(compress=_fake_compress)
+    )
+    # Sentinel ML: if the flip WRONGLY dropped into a Kompress fallback we'd see
+    # KOMPRESS appended to the chain; the chain assertion catches it.
+    monkeypatch.setattr(
+        router, "_try_ml_compressor", lambda *a, **k: ("KOMPRESS_SENTINEL", 999_999)
+    )
+
+    content = "def foo():\n    " + "x = 1\n    " * 40 + "return x\n"
+    out, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.CODE_AWARE, "q", language="python", bias=1.0
+    )
+    assert out == shrunk
+    # CODE_AWARE's historical token metric is len(compressed.split()), NOT _estimate_tokens.
+    assert tokens == len(shrunk.split())
+    assert chain == [CompressionStrategy.CODE_AWARE.value]
+    # The flip forwarded content, language, and context through the registry adapter.
+    assert seen == {"content": content, "language": "python", "context": "q"}
+
+
+def test_code_aware_unavailable_falls_back_to_kompress(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CODE_AWARE-RETURNS-NONE: with the code compressor UNAVAILABLE (tree-sitter
+    # missing) the branch's local `compressed` stays None, so the EXISTING inline
+    # Kompress fallback runs — the flip touches none of that logic. Mock
+    # _try_ml_compressor so NO real ML runs, and assert the SAME strategy_chain
+    # ([code_aware, kompress]) the historical direct dispatch produced.
+    router = _fallback_router()
+    _isolate_branch(monkeypatch, router)
+    monkeypatch.setattr(router, "_get_code_compressor", lambda: None)
+    monkeypatch.setattr(
+        router,
+        "_try_ml_compressor",
+        lambda content, ctx, q: ("KOMPRESSED::" + content, 3),
+    )
+    content = "def foo():\n    return 1\n"
+    out, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.CODE_AWARE, "ctx", language=None, bias=1.0
+    )
+    assert out == "KOMPRESSED::" + content
+    assert tokens == 3
+    assert chain == [CompressionStrategy.CODE_AWARE.value, CompressionStrategy.KOMPRESS.value]
+
+
+def test_html_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    # HTML-EXTRACT-SUCCEEDS: the flip routes through the registry "html" adapter,
+    # which delegates to the SAME getter + extract(). A deterministic fake getter
+    # keeps this offline (no trafilatura) and records the call arg.
+    router = _fallback_router()
+    _isolate_branch(monkeypatch, router)
+    extracted = "Extracted article body text that trafilatura would return."
+    seen: dict[str, object] = {}
+
+    def _fake_extract(content: str) -> SimpleNamespace:
+        seen["content"] = content
+        return SimpleNamespace(extracted=extracted)
+
+    monkeypatch.setattr(
+        router, "_get_html_extractor", lambda: SimpleNamespace(extract=_fake_extract)
+    )
+    content = "<html><body><article><p>hello world</p></article></body></html>"
+    out, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.HTML, "", bias=1.0
+    )
+    assert out == extracted
+    assert tokens == _estimate_tokens(extracted)
+    assert chain == [CompressionStrategy.HTML.value]
+    assert seen == {"content": content}
+
+
+def test_html_extract_none_falls_through_to_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    # HTML-EXTRACT-NONE: when extraction yields None the adapter reports
+    # compressed=False, the branch's local `compressed` collapses to None, and the
+    # function falls through to the bottom passthrough exactly as the historical
+    # `result.extracted is None` path — chain [html, passthrough], content verbatim.
+    router = _fallback_router()
+    _isolate_branch(monkeypatch, router)
+    monkeypatch.setattr(
+        router,
+        "_get_html_extractor",
+        lambda: SimpleNamespace(extract=lambda content: SimpleNamespace(extracted=None)),
+    )
+    # Sentinel ML so we'd notice if the None path wrongly reached a lossy compressor.
+    monkeypatch.setattr(router, "_try_ml_compressor", lambda *a, **k: ("KOMPRESS_SENTINEL", 1))
+    content = "<html><body><script>no extractable article body</script></body></html>"
+    out, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.HTML, "", bias=1.0
+    )
+    assert out == content
+    assert tokens == _estimate_tokens(content)
+    assert chain == [CompressionStrategy.HTML.value, CompressionStrategy.PASSTHROUGH.value]
+
+
+def test_diff_deferred_no_registry_entry() -> None:
+    # DIFF is DEFERRED: there is no "diff" built-in adapter/descriptor in the
+    # registry inventory, so registry resolution would return None and fall back
+    # to raw content — NOT byte-identical. It stays on its direct dispatch until a
+    # diff built-in adapter lands (PR-A scope).
+    router = _router()
+    assert router.compressor_registry.get("diff") is None
+    assert "diff" not in {d.name for d in _BUILTIN_COMPRESSOR_DESCRIPTORS}
 
 
 def test_kompress_deferred_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:

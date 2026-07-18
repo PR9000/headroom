@@ -218,6 +218,56 @@ def test_image_adapter_is_documented_passthrough() -> None:
     _assert_output_contract(out, inp, entry)
 
 
+# ───────────────────── compressed-signal (did-compress flag) ─────────────────
+
+
+def test_default_compress_output_flag_is_true() -> None:
+    # Additive contract: `compressed` defaults True so existing/external
+    # compressors that never set it are unaffected (treated as having compressed).
+    out = CompressOutput(content="x", tokens_before=1, tokens_after=1, lossless=True)
+    assert out.compressed is True
+
+
+def test_adapter_reports_compressed_true_when_builtin_returns_content() -> None:
+    # A built-in that returns real content → compressed=True and that content.
+    descriptor = _BUILTIN_COMPRESSOR_DESCRIPTORS[0]
+    entry = _BuiltinCompressorEntry(descriptor, router=object(), invoke=lambda r, inp: "SHRUNK")
+    out = entry.compress(
+        CompressInput(content="a longer original block", content_type="text/plain")
+    )
+    assert out.compressed is True
+    assert out.content == "SHRUNK"
+
+
+def test_adapter_reports_compressed_false_when_builtin_returns_none() -> None:
+    # A built-in that returns None (unavailable / not applicable to this str
+    # input) → compressed=False and the ORIGINAL content passed through unchanged.
+    descriptor = _BUILTIN_COMPRESSOR_DESCRIPTORS[0]
+    entry = _BuiltinCompressorEntry(descriptor, router=object(), invoke=lambda r, inp: None)
+    out = entry.compress(CompressInput(content="original", content_type="text/plain"))
+    assert out.compressed is False
+    assert out.content == "original"
+
+
+def test_adapter_reports_compressed_false_when_no_router() -> None:
+    # No bound router → nothing to delegate to → compressed=False, passthrough.
+    descriptor = _BUILTIN_COMPRESSOR_DESCRIPTORS[0]
+    entry = _BuiltinCompressorEntry(descriptor, router=None)
+    out = entry.compress(CompressInput(content="original", content_type="text/plain"))
+    assert out.compressed is False
+    assert out.content == "original"
+
+
+def test_image_builtin_adapter_reports_not_compressed() -> None:
+    # The image built-in never compresses str content (documented passthrough) →
+    # compressed=False, original content unchanged.
+    router = _router()
+    entry = _entry(router, "image")
+    out = entry.compress(CompressInput(content="not an image payload", content_type="image/png"))
+    assert out.compressed is False
+    assert out.content == "not an image payload"
+
+
 # ──────────────────────── registry-wide invariants ───────────────────────────
 
 
