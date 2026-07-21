@@ -74,6 +74,9 @@ class _DummyMetrics:
     async def record_failed(self, **kwargs) -> None:
         return None
 
+    def record_compression_failed(self, reason: str) -> None:
+        return None
+
 
 class _ResponseStub:
     def __init__(self, status_code: int = 200) -> None:
@@ -162,6 +165,14 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
             get_or_create=lambda *a, **k: SimpleNamespace(
+                _cached_token_count=0,
+                get_frozen_message_count=lambda: 0,
+                get_last_original_messages=lambda: [],
+                get_last_forwarded_messages=lambda: [],
+                update_from_response=lambda *a, **k: None,
+                record_request=lambda *a, **k: None,
+            ),
+            resolve_tracker=lambda *a, **k: SimpleNamespace(
                 _cached_token_count=0,
                 get_frozen_message_count=lambda: 0,
                 get_last_original_messages=lambda: [],

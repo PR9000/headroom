@@ -7,8 +7,10 @@ import ctypes
 import hashlib
 import json
 import logging
+import math
 import os
 import time
+from contextvars import ContextVar
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,6 +43,8 @@ _API_TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_API_TOKEN",
     "COPILOT_PROVIDER_BEARER_TOKEN",
 )
+_REFRESH_OAUTH_TOKEN_ENV_VAR = "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN"
+_API_TOKEN_EXPIRES_AT_ENV_VAR = "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT"
 _COPILOT_OAUTH_TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_GITHUB_TOKEN",
     "GITHUB_COPILOT_TOKEN",
@@ -94,6 +98,8 @@ class CopilotSubscriptionTokenResolution:
     confidence: str
     api_url: str
     token_fingerprint: str
+    refresh_oauth_token: str | None = None
+    api_token_expires_at: float | None = None
 
 
 def token_fingerprint(token: str) -> str:
@@ -164,6 +170,12 @@ def _configured_enterprise_domain() -> str | None:
     if not enterprise_url:
         return None
     return _copilot_subdomain_enterprise_host(enterprise_url)
+
+
+def default_oauth_domain() -> str:
+    """Return the OAuth domain from GITHUB_COPILOT_ENTERPRISE_URL, or github.com."""
+    domain = _configured_enterprise_domain()
+    return domain if domain else DEFAULT_GITHUB_HOST
 
 
 def _configured_api_url() -> str:
@@ -369,6 +381,8 @@ def _parse_expiry(value: Any) -> float | None:
 
     if isinstance(value, int | float):
         number = float(value)
+        if not math.isfinite(number):
+            return None
         if number > 10_000_000_000:
             return number / 1000.0
         return number
@@ -379,6 +393,10 @@ def _parse_expiry(value: Any) -> float | None:
             return None
         if raw.isdigit():
             return _parse_expiry(int(raw))
+        try:
+            return _parse_expiry(float(raw))
+        except ValueError:
+            pass
         try:
             normalized = raw.replace("Z", "+00:00")
             return datetime.fromisoformat(normalized).timestamp()
@@ -795,6 +813,8 @@ def _subscription_resolution(
     source: str,
     confidence: str,
     api_url: str,
+    refresh_oauth_token: str | None = None,
+    api_token_expires_at: float | None = None,
 ) -> CopilotSubscriptionTokenResolution:
     return CopilotSubscriptionTokenResolution(
         token=token,
@@ -802,6 +822,8 @@ def _subscription_resolution(
         confidence=confidence,
         api_url=api_url,
         token_fingerprint=token_fingerprint(token),
+        refresh_oauth_token=refresh_oauth_token,
+        api_token_expires_at=api_token_expires_at,
     )
 
 
@@ -833,6 +855,8 @@ def _subscription_resolution_from_token_exchange(
         source=f"{candidate.source}:token-exchange",
         confidence="copilot-token-exchange",
         api_url=_api_url_from_exchange_payload(payload, oauth_token=candidate.token),
+        refresh_oauth_token=candidate.token,
+        api_token_expires_at=_parse_expiry(payload.get("expires_at")),
     )
 
 
@@ -929,13 +953,69 @@ def _is_ghe_copilot_api_host(host: str) -> bool:
     )
 
 
+# Per-request flag: set when a request is routed to the GitHub Copilot API so
+# the single outcome funnel can label the provider "copilot" regardless of the
+# wire shape (OpenAI or Anthropic) the request travelled on. A ContextVar is
+# task-local, so it never bleeds across concurrent requests. A ContextVar value
+# nonetheless persists until overwritten within a single execution context, so
+# the outcome funnel consumes it (read-and-clear) rather than just reading it —
+# otherwise a later non-Copilot outcome in the same context (e.g. successive
+# messages on one WebSocket task) would be mislabeled.
+_request_routed_to_copilot: ContextVar[bool] = ContextVar(
+    "_request_routed_to_copilot", default=False
+)
+
+
+def mark_request_routed_to_copilot() -> None:
+    """Flag the current request as routed to the GitHub Copilot API."""
+    _request_routed_to_copilot.set(True)
+
+
+def request_routed_to_copilot() -> bool:
+    """Return True when the current request was routed to the Copilot API.
+
+    Read-only; does not clear the flag. Prefer :func:`consume_request_routed_to_copilot`
+    at the point the label is applied so the flag cannot leak to a later outcome.
+    """
+    return _request_routed_to_copilot.get()
+
+
+def consume_request_routed_to_copilot() -> bool:
+    """Return whether the current request was routed to the Copilot API, and
+    clear the flag so a subsequent outcome emitted in the same execution context
+    is not mislabeled."""
+    routed = _request_routed_to_copilot.get()
+    if routed:
+        reset_request_routed_to_copilot()
+    return routed
+
+
+def reset_request_routed_to_copilot() -> None:
+    """Clear the Copilot routing flag. For test isolation and any explicit
+    request-boundary reset (build_copilot_upstream_url sets it as a side effect,
+    so callers outside a request task should reset it to avoid leaking state)."""
+    _request_routed_to_copilot.set(False)
+
+
 def build_copilot_upstream_url(base_url: str, path: str) -> str:
     """Build an upstream URL, normalizing GitHub Copilot's non-/v1 path layout."""
 
     normalized_base = base_url.rstrip("/")
     normalized_path = path if path.startswith("/") else f"/{path}"
-    if is_copilot_api_url(normalized_base) and normalized_path.startswith("/v1/"):
-        normalized_path = normalized_path[3:]
+    if is_copilot_api_url(normalized_base):
+        # Single routing chokepoint for every Copilot surface (OpenAI
+        # chat/responses and Anthropic messages all build their upstream URL
+        # here), so mark the request for provider relabeling downstream.
+        mark_request_routed_to_copilot()
+        # Copilot serves its OpenAI-compatible surface WITHOUT a ``/v1`` prefix
+        # (``/chat/completions``, ``/responses``, ...), so strip it there. But its
+        # Anthropic surface for Claude models IS ``/v1/messages`` (with the
+        # ``/v1``); stripping it forwarded ``/messages`` and Copilot returned 404
+        # for claude-* models (#2409). Keep ``/v1`` for the messages endpoint.
+        if normalized_path.startswith("/v1/") and not normalized_path.startswith("/v1/messages"):
+            normalized_path = normalized_path[3:]
+    else:
+        reset_request_routed_to_copilot()
     return f"{normalized_base}{normalized_path}"
 
 
@@ -990,7 +1070,8 @@ class CopilotTokenProvider:
 
     async def get_api_token(self) -> CopilotAPIToken:
         explicit_api_token = os.environ.get("GITHUB_COPILOT_API_TOKEN", "").strip()
-        if explicit_api_token:
+        refresh_oauth_token = os.environ.get(_REFRESH_OAUTH_TOKEN_ENV_VAR, "").strip()
+        if explicit_api_token and not refresh_oauth_token:
             return CopilotAPIToken(
                 token=explicit_api_token,
                 expires_at=time.time() + 3600,
@@ -1005,6 +1086,21 @@ class CopilotTokenProvider:
             cached = self._cached
             if cached is not None and cached.is_valid:
                 return cached
+
+            if explicit_api_token and refresh_oauth_token:
+                if cached is None:
+                    seeded_expires_at = _parse_expiry(os.environ.get(_API_TOKEN_EXPIRES_AT_ENV_VAR))
+                    seeded = CopilotAPIToken(
+                        token=explicit_api_token,
+                        expires_at=seeded_expires_at if seeded_expires_at is not None else 0.0,
+                        api_url=_configured_api_url(),
+                    )
+                    self._cached = seeded
+                    if seeded.is_valid:
+                        return seeded
+                exchanged = await self._exchange_token(refresh_oauth_token)
+                self._cached = exchanged
+                return exchanged
 
             oauth_token = read_cached_oauth_token()
             if not oauth_token:
@@ -1142,6 +1238,20 @@ def _token_kind(token: str) -> str:
     return "unknown" if t else "empty"
 
 
+def _is_managed_copilot_seeded_bearer(token: str) -> bool:
+    """Return True when the incoming bearer is the proxy's seeded wrapper token."""
+
+    refresh_oauth_token = os.environ.get(_REFRESH_OAUTH_TOKEN_ENV_VAR, "").strip()
+    explicit_api_token = os.environ.get("GITHUB_COPILOT_API_TOKEN", "").strip()
+    normalized = token.strip()
+    return bool(
+        refresh_oauth_token
+        and explicit_api_token
+        and normalized
+        and normalized == explicit_api_token
+    )
+
+
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
     """Apply Copilot auth headers for GitHub Copilot API requests."""
     resolved = dict(headers)
@@ -1159,14 +1269,20 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
             and raw_token
             and _is_forwardable_copilot_bearer_token(raw_token)
         ):
-            logger.info(
-                "apply_copilot_api_auth: passing through client token kind=%s",
-                _token_kind(raw_token),
-            )
-            for key in list(resolved):
-                if key.lower() == "x-api-key":
-                    resolved.pop(key)
-            return resolved
+            if _is_managed_copilot_seeded_bearer(raw_token):
+                logger.info(
+                    "apply_copilot_api_auth: managed seed token kind=%s, will replace",
+                    _token_kind(raw_token),
+                )
+            else:
+                logger.info(
+                    "apply_copilot_api_auth: passing through client token kind=%s",
+                    _token_kind(raw_token),
+                )
+                for key in list(resolved):
+                    if key.lower() == "x-api-key":
+                        resolved.pop(key)
+                return resolved
         logger.info(
             "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
             _token_kind(raw_token) if raw_token else "none",
