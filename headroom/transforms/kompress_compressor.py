@@ -1150,7 +1150,7 @@ class KompressCompressor(Transform):
     def _timed_canary(self, model: Any, tokenizer: Any, backend: str) -> float:
         """Run one small inference and return its wall-clock seconds."""
         words = _canary_words()
-        is_onnx = backend == "onnx"
+        is_onnx = backend.startswith("onnx")
         encoding = tokenizer(
             words,
             is_split_into_words=True,
@@ -1251,7 +1251,7 @@ class KompressCompressor(Transform):
             model, tokenizer, backend = _load_kompress(
                 self.config.model_id, self.config.device, allow_download=allow_download
             )
-            is_onnx = backend == "onnx"
+            is_onnx = backend.startswith("onnx")
             device_type = _model_device_type(model, backend)
 
             if self._should_batch_single_content(model, backend):
@@ -1604,7 +1604,7 @@ class KompressCompressor(Transform):
                     results[i] = self._passthrough(contents[i], len(word_lists[i]))
             return [r for r in results if r is not None]
 
-        is_onnx = backend == "onnx"
+        is_onnx = backend.startswith("onnx")
         device_type = _model_device_type(model, backend)
         kept_ids_per_text: dict[int, set[int]] = {i: set() for i in range(n) if results[i] is None}
         inference_ms = 0.0
@@ -1830,8 +1830,8 @@ class KompressCompressor(Transform):
 
         model, _tokenizer, backend = _kompress_cache[model_id]
 
-        if backend == "onnx":
-            return True  # ONNX CPU provider doesn't parallelize batch dim
+        if backend.startswith("onnx"):
+            return True  # ONNX EPs don't parallelize the batch dim
         if backend == "pytorch":
             try:
                 import torch

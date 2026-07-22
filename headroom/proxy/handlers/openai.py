@@ -7939,11 +7939,54 @@ class OpenAIHandlerMixin:
             with contextlib.suppress(Exception):
                 await websocket.close()
 
+    def _lossy_inline_pipeline(self) -> Any:
+        """Cached pipeline for ``/v1/compress`` ``config.mode="lossy_inline"``.
+
+        Runs the lossless byte/data fold first, then Kompresses the folded
+        remainder (``lossless_then_lossy``). ``ccr_inject_marker=False`` makes
+        every compressor (Kompress, SmartCrusher, search/log/config) emit inline
+        lossy output with NO ``<<ccr:…>>`` / ``Retrieve more: hash=`` marker and
+        NO CCR store write, so the result is safe to forward straight to a
+        provider with no retrieval round-trip. Derived once from the live OpenAI
+        router's config and reused read-only across requests.
+
+        ponytail: a first-request race just builds it twice — both are
+        equivalent and Kompress weights are cached at module level, so no lock.
+        """
+        cached = getattr(self, "_lossy_inline_pipeline_cache", None)
+        if cached is not None:
+            return cached
+
+        from headroom.transforms.compression_units import find_content_router
+        from headroom.transforms.content_router import ContentRouter
+        from headroom.transforms.pipeline import TransformPipeline
+
+        base = find_content_router(self.openai_pipeline)
+        if base is None:  # ponytail: nothing to derive from — use default pipeline
+            return self.openai_pipeline
+        cfg = replace(
+            base.config,
+            lossless=False,  # lossy mode (not lossless-only)
+            lossless_then_lossy=True,  # fold first, then Kompress the remainder
+            ccr_inject_marker=False,  # inline, marker-free everywhere
+            ccr_enabled=False,  # no CCR store writes
+            smart_crusher_lossless_only=False,  # keep SmartCrusher lossy
+        )  # enable_kompress inherited: on by default, off if operator disabled it
+        pipeline = TransformPipeline(
+            transforms=[ContentRouter(cfg, observer=self.metrics)],
+            provider=self.openai_provider,
+        )
+        self._lossy_inline_pipeline_cache = pipeline
+        return pipeline
+
     async def handle_compress(self, request: Request) -> JSONResponse:
         """Compress messages without calling an LLM.
 
         POST /v1/compress
         Body: {"messages": [...], "model": "...", "config": {}}
+        ``config.mode="lossy_inline"`` (alias ``"lossless_then_lossy"``) selects
+        the marker-free lossless-then-lossy pipeline whose output needs no CCR
+        retrieval round-trip — the mode to use behind a gateway/sidecar.
         Returns compressed messages + metrics.
         """
         from fastapi.responses import JSONResponse
@@ -8040,10 +8083,20 @@ class OpenAIHandlerMixin:
             )
             # Extract CompressConfig options from request body
             compress_config = body.get("config", {})
+            if not isinstance(compress_config, dict):
+                compress_config = {}
             compress_user_messages = compress_config.get("compress_user_messages", False)
             target_ratio = compress_config.get("target_ratio")
             protect_recent = compress_config.get("protect_recent")
             protect_analysis_context = compress_config.get("protect_analysis_context")
+            # Marker-free lossless-then-lossy mode: safe to forward downstream
+            # with no CCR retrieval round-trip (see _lossy_inline_pipeline).
+            mode = compress_config.get("mode")
+            pipeline = (
+                self._lossy_inline_pipeline()
+                if mode in ("lossy_inline", "lossless_then_lossy")
+                else self.openai_pipeline
+            )
 
             pipeline_kwargs: dict = {
                 "model_limit": context_limit,
@@ -8064,7 +8117,7 @@ class OpenAIHandlerMixin:
             # until it finished (#718). The executor also enforces a timeout so a
             # too-large body fails fast instead of hanging forever.
             result = await self._run_compression_in_executor(
-                lambda: self.openai_pipeline.apply(
+                lambda: pipeline.apply(
                     messages=messages,
                     model=model,
                     **pipeline_kwargs,
@@ -8094,6 +8147,12 @@ class OpenAIHandlerMixin:
                     overhead_ms=latency_ms,
                     num_messages=len(messages) if isinstance(messages, list) else 0,
                     transforms_applied=tuple(result.transforms_applied or ()),
+                    waste_signals=(
+                        result.waste_signals.to_dict()
+                        if getattr(result, "waste_signals", None) is not None
+                        else None
+                    ),
+                    pipeline_timing=getattr(result, "timing", None) or None,
                     tags=tags,
                     client=client,
                 )

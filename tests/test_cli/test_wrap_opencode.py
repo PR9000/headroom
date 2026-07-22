@@ -33,6 +33,12 @@ def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
 
 
+def _clear_copilot_route_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+
+
 def _subscription_resolution() -> CopilotSubscriptionTokenResolution:
     return CopilotSubscriptionTokenResolution(
         token="copilot-api-secret",
@@ -50,13 +56,14 @@ def _subscription_resolution() -> CopilotSubscriptionTokenResolution:
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
+def test_wrap_opencode_copilot_subscription_normalizes_enterprise_host_and_handoffs_seed_after_actual_port(
     runner: CliRunner,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
+    _clear_copilot_route_config(monkeypatch)
     monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "inherited-api-secret")
     monkeypatch.setenv("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN", "inherited-refresh-secret")
     monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT", "999.0")
@@ -77,11 +84,33 @@ def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
 
     with (
         patch.object(wrap_mod.shutil, "which", return_value="opencode"),
-        patch.object(
-            wrap_mod,
-            "_require_copilot_subscription_resolution",
-            return_value=_subscription_resolution(),
+        patch(
+            "headroom.copilot_auth.iter_oauth_token_candidates",
+            return_value=[
+                type(
+                    "_Candidate",
+                    (),
+                    {
+                        "token": "gho-oauth",
+                        "source": "headroom-copilot-auth:/tmp/copilot_auth.json",
+                        "confidence": "copilot-oauth",
+                        "validate_for_subscription": True,
+                    },
+                )()
+            ],
         ),
+        patch(
+            "headroom.copilot_auth.CopilotTokenProvider._exchange_token_sync",
+            staticmethod(
+                lambda _headers: {
+                    "token": "copilot-api-secret",
+                    "expires_at": 123.5,
+                    "refresh_token": "copilot-refresh-secret",
+                    "endpoints": {"api": "https://api.enterprise.githubcopilot.com"},
+                }
+            ),
+        ),
+        patch("headroom.copilot_auth._fetch_copilot_user_info", return_value=None),
         patch.object(wrap_mod, "_ensure_proxy", side_effect=fake_ensure_proxy),
         patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool),
     ):
@@ -101,7 +130,7 @@ def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
     ensure = captured["ensure"]
     assert ensure["openai_api_url"] == "https://api.githubcopilot.com"
     assert ensure["copilot_api_token"] == "copilot-api-secret"
-    assert ensure["copilot_refresh_oauth_token"] == "copilot-refresh-secret"
+    assert ensure["copilot_refresh_oauth_token"] == "gho-oauth"
     assert ensure["copilot_api_token_expires_at"] == 123.5
     launch = captured["launch"]
     assert launch["port"] == 9010
@@ -137,6 +166,7 @@ def test_wrap_opencode_copilot_subscription_rejects_incompatible_modes(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
+    _clear_copilot_route_config(monkeypatch)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True)
     config_file.write_text("{}", encoding="utf-8")
@@ -157,6 +187,7 @@ def test_wrap_opencode_copilot_subscription_rejects_headroom_backend_env(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
+    _clear_copilot_route_config(monkeypatch)
     monkeypatch.setenv("HEADROOM_BACKEND", "anyllm")
     with patch.object(wrap_mod, "_ensure_proxy", side_effect=AssertionError("proxy launched")):
         result = runner.invoke(
@@ -174,6 +205,7 @@ def test_wrap_opencode_copilot_subscription_requires_login_before_launch(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
+    _clear_copilot_route_config(monkeypatch)
     with (
         patch.object(
             wrap_mod,
@@ -197,6 +229,7 @@ def test_wrap_opencode_copilot_subscription_cleans_up_proxy_on_config_failure(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
+    _clear_copilot_route_config(monkeypatch)
 
     class _FakeProxy:
         def __init__(self) -> None:
